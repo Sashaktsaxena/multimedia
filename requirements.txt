@@ -1,0 +1,9 @@
+opencv-python>=4.5.0
+mediapipe>=0.10.0
+numpy>=1.20.0
+pillow>=8.0.0       # For future: image display, GUI overlays
+pyglet>=1.5.0       # Optional: for video sound playback if expanded
+python-dotenv       # Optional: for managing config via .env file
+pyautogui           # For gesture to keyboard automation (if needed)
+PyQt5               # For a professional GUI
+moviepy             # For handling GIF/MP4 previews
