@@ -8,7 +8,8 @@ import threading
 from tkinter import Canvas, filedialog, messagebox
 import numpy as np
 import sounddevice as sd
-
+import subprocess
+import imageio_ffmpeg
 
 # Setup MediaPipe
 mp_hands = mp.solutions.hands
@@ -18,6 +19,131 @@ mp_draw = mp.solutions.drawing_utils
 # Setup theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+
+# === FFmpeg Audio Player ===
+class FFmpegAudioPlayer:
+    def __init__(self, file_path: str, samplerate: int = 44100, channels: int = 2):
+        self.file_path = file_path
+        try:
+            self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except:
+            self.ffmpeg_exe = "ffmpeg"
+        self.sr = int(samplerate)
+        self.channels = int(channels)
+        self.proc = None
+        self.stream = None
+        self.thread = None
+        self.stop_flag = threading.Event()
+        self.volume = 1.0
+        self.muted = False
+        self.lock = threading.Lock()
+
+    def start(self, start_time: float = 0.0):
+        self.stop()  # Remove lock from here
+        try:
+            args = [
+                self.ffmpeg_exe,
+                "-loglevel", "quiet",
+                "-ss", f"{max(0.0, float(start_time))}",
+                "-i", self.file_path,
+                "-vn",
+                "-f", "s16le",
+                "-acodec", "pcm_s16le",
+                "-ac", str(self.channels),
+                "-ar", str(self.sr),
+                "pipe:1",
+            ]
+            self.proc = subprocess.Popen(
+                args, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                bufsize=8192,  # Larger buffer
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            self.stream = sd.RawOutputStream(
+                samplerate=self.sr, 
+                channels=self.channels, 
+                dtype="int16", 
+                blocksize=4096  # Larger blocksize
+            )
+            self.stream.start()
+            self.stop_flag.clear()
+            self.thread = threading.Thread(target=self._pump, daemon=True)
+            self.thread.start()
+        except Exception as e:
+            print(f"⚠️ Audio start failed: {e}")
+            self.stop()
+
+    def _pump(self):
+        chunk_size = 4096 * 2 * self.channels  # Larger chunks
+        try:
+            while not self.stop_flag.is_set():
+                if self.proc is None or self.proc.stdout is None:
+                    break
+                try:
+                    # Non-blocking read with timeout
+                    data = self.proc.stdout.read(chunk_size)
+                    if not data:
+                        break
+                    
+                    # Apply volume without holding lock
+                    if self.muted or self.volume <= 0.0:
+                        out = b"\x00" * len(data)
+                    elif self.volume >= 0.999:
+                        out = data
+                    else:
+                        arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                        arr = np.clip(arr * float(self.volume), -32768, 32767).astype(np.int16)
+                        out = arr.tobytes()
+                    
+                    if self.stream and not self.stop_flag.is_set():
+                        self.stream.write(out)
+                except Exception as e:
+                    if not self.stop_flag.is_set():
+                        print(f"⚠️ Audio pump error: {e}")
+                    break
+        except Exception as e:
+            print(f"⚠️ Audio pump fatal: {e}")
+        finally:
+            pass  # Don't call stop() here to avoid deadlock
+
+    def set_volume(self, vol: float):
+        self.volume = max(0.0, min(1.0, float(vol)))
+
+    def set_muted(self, muted: bool):
+        self.muted = bool(muted)
+
+    def stop(self):
+        self.stop_flag.set()
+        
+        # Close stream first
+        if self.stream:
+            try:
+                self.stream.abort()  # Force immediate stop
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = None
+        
+        # Terminate FFmpeg process
+        if self.proc:
+            try:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=0.5)
+                except:
+                    self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+        
+        # Wait for thread
+        if self.thread and self.thread.is_alive() and threading.current_thread() != self.thread:
+            try:
+                self.thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self.thread = None
 
 # Create main window
 class MediaPlayer(ctk.CTk):
@@ -182,13 +308,17 @@ class MediaPlayer(ctk.CTk):
         self.right_controls.pack(side="right")
 
         ctk.CTkLabel(self.right_controls, text="Volume:").pack(side="left", padx=5)
-        self.volume_slider = ctk.CTkSlider(self.right_controls, from_=0, to=100, width=100)
+        self.volume_slider = ctk.CTkSlider(self.right_controls, from_=0, to=100, width=100, command=self.on_volume_change)
         self.volume_slider.pack(side="right", padx=5)
         self.volume_slider.set(100)
 
         # Initialize video capture as None
         self.video = None
         self.video_loaded = False
+        self.video_path = None
+
+        # Audio state
+        self.audio_player = None
 
         # Playlist state
         self.playlist = []
@@ -209,26 +339,20 @@ class MediaPlayer(ctk.CTk):
         self.gesture_cooldown = 1.2  # seconds
         self.running = True
 
-        # REMOVE thread; use main-thread after loop instead
-        # self.video_thread = threading.Thread(target=self.update_frames, daemon=True)
-        # self.video_thread.start()
         self.after(16, self.update_frames)  # ~60 FPS update on main thread
 
     # ===== Playlist helpers =====
     def render_playlist(self):
-        # Clear UI
         for w in self.playlist_item_buttons:
             w.destroy()
         self.playlist_item_buttons.clear()
 
-        # Rebuild
         for i, path in enumerate(self.playlist):
             name = os.path.basename(path)
             is_current = (i == self.current_index)
             btn = ctk.CTkButton(
                 self.playlist_frame,
                 text=("▶ " if is_current else "   ") + name,
-                # anchor removed; CTkButton doesn't support 'anchor'
                 width=250,
                 command=lambda idx=i: self.load_from_playlist(idx)
             )
@@ -240,15 +364,13 @@ class MediaPlayer(ctk.CTk):
     def add_to_playlist(self):
         files = filedialog.askopenfilenames(
             title="Add Videos to Playlist",
-            filetypes=[("Video Files", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.webm"), ("All Files", "*")]
+            filetypes=[("Video Files", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.webm"), ("All Files", "*.*")]
         )
         if not files:
             return
-        # Extend playlist (avoid duplicates)
         for f in files:
             if f not in self.playlist:
                 self.playlist.append(f)
-        # Autoload first if nothing loaded yet
         if self.current_index == -1 and self.playlist:
             self.load_from_playlist(0)
         self.render_playlist()
@@ -258,8 +380,7 @@ class MediaPlayer(ctk.CTk):
             return
         self.current_index = index
         self.load_video_file(self.playlist[index], announce=False)
-        self.playing = True
-        self.play_button.configure(text="Pause")
+        self.set_playing(True)
         self.render_playlist()
 
     def play_next(self, auto=True):
@@ -268,9 +389,7 @@ class MediaPlayer(ctk.CTk):
         nxt = self.current_index + 1
         if nxt >= len(self.playlist):
             if auto:
-                # Stop at end of playlist
-                self.playing = False
-                self.play_button.configure(text="Play")
+                self.set_playing(False)
                 return
             else:
                 nxt = 0
@@ -299,7 +418,6 @@ class MediaPlayer(ctk.CTk):
             ]
         )
         if file_path:
-            # If using playlist, update current index accordingly
             if file_path not in self.playlist:
                 self.playlist.append(file_path)
             self.current_index = self.playlist.index(file_path)
@@ -307,6 +425,9 @@ class MediaPlayer(ctk.CTk):
             self.render_playlist()
 
     def load_video_file(self, file_path: str, announce: bool = True):
+        # Stop previous audio
+        self.stop_audio()
+        
         # Release previous video if any
         if self.video is not None:
             self.video.release()
@@ -320,6 +441,7 @@ class MediaPlayer(ctk.CTk):
             self.video_loaded = False
             return
         
+        self.video_path = file_path
         self.video_loaded = True
         self.playing = False
         
@@ -338,16 +460,45 @@ class MediaPlayer(ctk.CTk):
         total_time = total_frames / fps if fps and fps > 0 else 0
         self.time_label.configure(text=f"0:00 / {self.format_time(total_time)}")
 
+        # Prepare audio
+        try:
+            self.audio_player = FFmpegAudioPlayer(file_path, samplerate=44100, channels=2)
+            self.audio_player.set_volume(self.volume_slider.get() / 100.0)
+            self.audio_player.set_muted(self.muted)
+        except Exception as e:
+            print(f"⚠️ Audio init failed: {e}")
+            self.audio_player = None
+
         if announce:
             messagebox.showinfo("Success", f"Video loaded successfully!\n{filename}")
+
+    # ===== Audio controls =====
+    def start_audio(self, start_time: float = 0.0):
+        if self.audio_player and not self.muted:
+            try:
+                self.audio_player.start(start_time)
+            except Exception as e:
+                print(f"⚠️ Audio start error: {e}")
+
+    def stop_audio(self):
+        if self.audio_player:
+            try:
+                self.audio_player.stop()
+            except Exception as e:
+                print(f"⚠️ Audio stop error: {e}")
+
+    def on_volume_change(self, _value):
+        if self.audio_player:
+            try:
+                self.audio_player.set_volume((0 if self.muted else self.volume_slider.get()) / 100.0)
+            except Exception as e:
+                print(f"⚠️ Volume change error: {e}")
 
     # ===== Utils and playback controls =====
     def get_fingers_up(self, hand):
         tip_ids = [4, 8, 12, 16, 20]
         fingers = []
-        # Thumb: left/right
         fingers.append(1 if hand.landmark[4].x < hand.landmark[3].x else 0)
-        # Other fingers: up/down
         for tip in tip_ids[1:]:
             fingers.append(1 if hand.landmark[tip].y < hand.landmark[tip - 2].y else 0)
         return fingers
@@ -356,6 +507,13 @@ class MediaPlayer(ctk.CTk):
         minutes = int(seconds // 60)
         seconds = int(seconds % 60)
         return f"{minutes}:{seconds:02d}"
+
+    def get_current_video_time(self) -> float:
+        if not self.video:
+            return 0.0
+        fps = self.video.get(cv2.CAP_PROP_FPS) or 0
+        pos = self.video.get(cv2.CAP_PROP_POS_FRAMES) or 0
+        return (pos / fps) if fps > 0 else 0.0
 
     def seek_video(self, event):
         if not self.video_loaded or self.video is None:
@@ -368,13 +526,24 @@ class MediaPlayer(ctk.CTk):
         total_frames = self.video.get(cv2.CAP_PROP_FRAME_COUNT)
         target_frame = int(total_frames * ratio)
         self.video.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        
+        if self.playing:
+            self.stop_audio()
+            self.start_audio(self.get_current_video_time())
 
     def toggle_play(self):
         if not self.video_loaded:
             messagebox.showwarning("No Video", "Please load a video first!")
             return
-        self.playing = not self.playing
+        self.set_playing(not self.playing)
+
+    def set_playing(self, is_playing: bool):
+        self.playing = is_playing
         self.play_button.configure(text="Pause" if self.playing else "Play")
+        if self.playing:
+            self.start_audio(self.get_current_video_time())
+        else:
+            self.stop_audio()
 
     def toggle_mute(self):
         self.muted = not self.muted
@@ -382,13 +551,17 @@ class MediaPlayer(ctk.CTk):
         if self.muted:
             self.volume_slider.set(0)
         else:
-            self.volume_slider.set(100)
+            if self.volume_slider.get() == 0:
+                self.volume_slider.set(100)
+        
+        if self.audio_player:
+            try:
+                self.audio_player.set_muted(self.muted)
+                self.audio_player.set_volume((0 if self.muted else self.volume_slider.get()) / 100.0)
+            except Exception as e:
+                print(f"⚠️ Mute toggle error: {e}")
 
     def get_gesture_name(self, fingers):
-        """
-        Map finger patterns to actions:
-        [Thumb, Index, Middle, Ring, Pinky]
-        """
         if fingers == [0, 1, 1, 1, 1]:
             return "✋ PLAY", "play"
         elif fingers == [0, 0, 0, 0, 0]:
@@ -402,9 +575,9 @@ class MediaPlayer(ctk.CTk):
         elif fingers == [0, 1, 0, 0, 1]:
             return "🤘 RESTART", "restart"
         elif fingers == [0, 1, 1, 1, 0]:
-            return "⏭ NEXT", "next"         # Index+Middle+Ring up
+            return "⏭ NEXT", "next"
         elif fingers == [0, 0, 1, 1, 1]:
-            return "⏮ PREVIOUS", "previous" # Middle+Ring+Pinky up
+            return "⏮ PREVIOUS", "previous"
         else:
             return "❓ UNKNOWN", None
 
@@ -412,14 +585,12 @@ class MediaPlayer(ctk.CTk):
         if not self.running:
             return
         try:
-            # Read webcam
             ret_cam, cam_frame = self.cam.read()
             if ret_cam:
                 cam_frame = cv2.flip(cam_frame, 1)
                 cam_rgb = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2RGB)
                 results = hands.process(cam_rgb)
 
-                # Detect gesture
                 gesture = None
                 gesture_display = "None"
                 finger_status = "- - - - -"
@@ -432,34 +603,33 @@ class MediaPlayer(ctk.CTk):
                         finger_status = " ".join([finger_names[i] if fingers[i] == 1 else "✖" for i in range(5)])
                         gesture_display, gesture = self.get_gesture_name(fingers)
 
-                # Update gesture labels (main thread safe)
                 self.current_gesture_label.configure(text=f"Current Gesture: {gesture_display}")
                 self.finger_status_label.configure(text=f"Fingers: {finger_status}")
 
-                # Trigger gesture if cooldown passed
                 current_time = time.time()
                 if gesture and self.video_loaded and (gesture != self.last_gesture or current_time - self.last_time > self.gesture_cooldown):
                     fps = self.video.get(cv2.CAP_PROP_FPS) if self.video else 0
                     pos = self.video.get(cv2.CAP_PROP_POS_FRAMES) if self.video else 0
 
                     if gesture == "play":
-                        self.playing = True
-                        self.play_button.configure(text="Pause")
+                        self.set_playing(True)
                     elif gesture == "pause":
-                        self.playing = False
-                        self.play_button.configure(text="Play")
+                        self.set_playing(False)
                     elif gesture == "forward" and self.video:
                         self.video.set(cv2.CAP_PROP_POS_FRAMES, pos + int(fps * 2))
+                        if self.playing:
+                            self.stop_audio()
+                            self.start_audio(self.get_current_video_time())
                     elif gesture == "rewind" and self.video:
                         self.video.set(cv2.CAP_PROP_POS_FRAMES, max(0, pos - int(fps * 2)))
+                        if self.playing:
+                            self.stop_audio()
+                            self.start_audio(self.get_current_video_time())
                     elif gesture == "mute":
-                        self.muted = not self.muted
-                        self.mute_button.configure(text="Unmute" if self.muted else "Mute")
+                        self.toggle_mute()
                     elif gesture == "restart" and self.video:
                         self.video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        self.video.read()
-                        self.playing = True
-                        self.play_button.configure(text="Pause")
+                        self.set_playing(True)
                     elif gesture == "next":
                         self.play_next(auto=False)
                     elif gesture == "previous":
@@ -468,19 +638,16 @@ class MediaPlayer(ctk.CTk):
                     self.last_gesture = gesture
                     self.last_time = current_time
 
-                # Draw gesture camera
                 cam_frame = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2RGB)
                 cam_frame = cv2.resize(cam_frame, (320, 240))
                 cam_photo = ImageTk.PhotoImage(Image.fromarray(cam_frame))
                 self.gesture_canvas.create_image(0, 0, anchor="nw", image=cam_photo)
                 self.gesture_canvas.image = cam_photo
 
-            # Update video playback
             if self.playing and self.video_loaded and self.video is not None:
                 ret_vid, frame = self.video.read()
                 if ret_vid:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # Fit to canvas while preserving aspect ratio
                     video_ratio = frame.shape[1] / frame.shape[0]
                     canvas_width = max(1, self.video_canvas.winfo_width())
                     canvas_height = max(1, self.video_canvas.winfo_height())
@@ -494,7 +661,6 @@ class MediaPlayer(ctk.CTk):
                         new_width = int(canvas_height * video_ratio)
                     frame = cv2.resize(frame, (new_width, new_height))
 
-                    # Visual indicator for mute/low volume
                     volume = 0 if self.muted else self.volume_slider.get() / 100
                     if volume < 0.1:
                         frame = cv2.convertScaleAbs(frame, alpha=0.7)
@@ -505,7 +671,6 @@ class MediaPlayer(ctk.CTk):
                     self.video_canvas.create_image(x, y, anchor="nw", image=video_photo)
                     self.video_canvas.image = video_photo
 
-                    # Progress/time
                     total_frames = self.video.get(cv2.CAP_PROP_FRAME_COUNT)
                     current_frame = self.video.get(cv2.CAP_PROP_POS_FRAMES)
                     fps = self.video.get(cv2.CAP_PROP_FPS)
@@ -517,18 +682,17 @@ class MediaPlayer(ctk.CTk):
                             text=f"{self.format_time(current_time_sec)} / {self.format_time(total_time)}"
                         )
                 else:
-                    # Auto next at end
                     self.play_next(auto=True)
         except Exception as e:
-            print(f"Error in update_frames: {e}")
+            print(f"⚠️ Error in update_frames: {e}")
         finally:
             if self.running:
-                self.after(16, self.update_frames)  # schedule next tick
+                self.after(16, self.update_frames)
 
     def cleanup(self):
         self.running = False
-        # Give pending after a moment to stop naturally
         time.sleep(0.1)
+        self.stop_audio()
         if self.cam:
             self.cam.release()
         if self.video:
